@@ -49,7 +49,6 @@ s_esp32_ws2812b_panel_color_t* s_esp32_ws2812b_panel_rgb_buffer;
 
 //INTERNAL FUNCTIONS
 static void s_esp32_ws2812b_panel_send_column(uint8_t col);
-static void s_esp32_ws2812b_panel_rmt_isr(void* pArg);
 
 
 void ESP32_WS2812B_PANEL_SetDebug(bool enable)
@@ -250,17 +249,3 @@ static void s_esp32_ws2812b_panel_send_column(uint8_t col)
     //SEND DATA OUT
     rmt_write_items(0, s_esp32_ws2812b_panel_buffer, (24 * s_esp32_ws2812b_panel_count_row), 1);
 }
-
-/*static void s_esp32_ws2812b_panel_rmt_isr(void* pArg)
-{
-    //RMT TX INTERRUPT
-    ets_printf("IABBAB!!!!!!\n");
-    if(RMT.int_st.ch0_tx_thr_event)
-    {
-        //CLEAR INTERRUPT EVENT
-        RMT.int_st.ch0_tx_thr_event = 1;
-        //SET NEXT COLUMN FOR TRANSFER
-        s_esp32_ws2812b_panel_next_coloumn++;
-        ets_printf("ISR!!!!!!!\n");
-    }
-}*/
