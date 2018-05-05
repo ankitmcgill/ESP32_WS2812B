@@ -45,10 +45,19 @@ typedef struct
 void ESP32_WS2812B_PANEL_SetDebug(bool enable);
 void ESP32_WS2812B_PANEL_Initialize(uint8_t rows, uint8_t columns, uint8_t data_gpio);
 
-bool ESP32_WS2812B_PANEL_SetPixel(uint8_t x, uint8_t y, uint8_t r, uint8_t g, uint8_t b);
+bool ESP32_WS2812B_PANEL_SetPixel(uint8_t x, 
+                                    uint8_t y, 
+                                    s_esp32_ws2812b_panel_color_t color);
+bool ESP32_WS2812B_PANEL_SetLineHorizontal(uint8_t x, 
+                                            uint8_t y, 
+                                            uint8_t len, 
+                                            s_esp32_ws2812b_panel_color_t color);
+bool ESP32_WS2812B_PANEL_SetLineVertical(uint8_t x, 
+                                            uint8_t y, 
+                                            uint8_t len, 
+                                            s_esp32_ws2812b_panel_color_t color);
 bool ESP32_WS2812B_PANEL_Clear(void);
-void ESP32_WS28182B_PANEL_Refresh(void);
 
-void ESP32_WS2812B_PANEL_Mainiter(void);
+void ESP32_WS28182B_PANEL_Refresh(void);
 
 #endif

@@ -33,23 +33,17 @@
 static bool s_debug;
 static bool s_ongoing;
 
-//RMT RELATED
-static intr_handle_t s_esp32_ws2812b_panel_interrupt_handle;
-uint16_t s_esp32_ws2812b_panel_blocksize;
-
 //DISPLAY RELATED
-uint8_t s_esp32_ws2812b_panel_count_row;
-uint8_t s_esp32_ws2812b_panel_count_col;
+static uint8_t s_esp32_ws2812b_panel_count_row;
+static uint8_t s_esp32_ws2812b_panel_count_col;
 
 //BUFFER RELATED
-static volatile uint8_t s_esp32_ws2812b_panel_next_coloumn;
-rmt_item32_t* s_esp32_ws2812b_panel_buffer;
-s_esp32_ws2812b_panel_color_t* s_esp32_ws2812b_panel_rgb_buffer;
-
+static s_esp32_ws2812b_panel_color_t* s_esp32_ws2812b_panel_rgb_buffer;
+static s_esp32_ws2812b_panel_color_t* s_esp32_ws2812b_next_pixel_pointer;
+static rmt_item32_t s_exp32_ws2812b_rmt_pixel[24];
 
 //INTERNAL FUNCTIONS
-static void s_esp32_ws2812b_panel_send_column(uint8_t col);
-
+static void s_esp32_ws2812b_panel_send_next_pixel(void);
 
 void ESP32_WS2812B_PANEL_SetDebug(bool enable)
 {
@@ -77,12 +71,12 @@ void ESP32_WS2812B_PANEL_Initialize(uint8_t rows, uint8_t columns, uint8_t data_
     s_esp32_ws2812b_panel_count_row = rows;
     s_esp32_ws2812b_panel_count_col = columns;
 
-    s_ongoing = false;
-
     //ALLOCATE BUFFERS
     s_esp32_ws2812b_panel_rgb_buffer = (s_esp32_ws2812b_panel_color_t*)calloc((rows * columns), 
                                                                 sizeof(s_esp32_ws2812b_panel_color_t));
-    s_esp32_ws2812b_panel_buffer = (rmt_item32_t*)calloc((rows * 24), sizeof(rmt_item32_t));
+
+    s_esp32_ws2812b_next_pixel_pointer = &s_esp32_ws2812b_panel_rgb_buffer[0];
+    s_ongoing = false;
 
     //CONFIGURE ESP32 RMT
     rmt_config_t config;
@@ -90,17 +84,17 @@ void ESP32_WS2812B_PANEL_Initialize(uint8_t rows, uint8_t columns, uint8_t data_
     config.channel = RMT_CHANNEL_0;
     config.gpio_num = data_gpio;
 
-    s_esp32_ws2812b_panel_blocksize = ((rows * 24) / 64) + 1;
+    uint16_t s_esp32_ws2812b_panel_blocksize = ((rows * 24) / 64) + 1;
 
     config.mem_block_num = s_esp32_ws2812b_panel_blocksize;
     config.tx_config.loop_en = 0;
     config.tx_config.carrier_en = 0;
-    config.tx_config.idle_output_en = 1;
+    config.tx_config.idle_output_en = 0;
     config.tx_config.idle_level = 0;
     config.tx_config.carrier_duty_percent = 50;
     config.tx_config.carrier_freq_hz = 10000;
     config.tx_config.carrier_level = 1;
-    config.clk_div = 28;
+    config.clk_div = 24;
     ets_printf(ESP32_WS2812B_PANEL_TAG" : RMT initialized\n");
 
     //START ESP32 RMT
@@ -114,9 +108,11 @@ void ESP32_WS2812B_PANEL_Initialize(uint8_t rows, uint8_t columns, uint8_t data_
                                                                         data_gpio);
 }
 
-bool ESP32_WS2812B_PANEL_SetPixel(uint8_t x, uint8_t y, uint8_t r, uint8_t g, uint8_t b)
+bool ESP32_WS2812B_PANEL_SetPixel(uint8_t x, 
+                                    uint8_t y, 
+                                    s_esp32_ws2812b_panel_color_t color)
 {
-    //SET PIXEL IN THE INTERNAL BUFFER
+    //SET PIXEL IN THE INTERNAL BUFFER WITH SPECIFIED COLOR
 
     if(s_ongoing)
     {
@@ -133,10 +129,74 @@ bool ESP32_WS2812B_PANEL_SetPixel(uint8_t x, uint8_t y, uint8_t r, uint8_t g, ui
     }
 
     uint32_t counter = (x * s_esp32_ws2812b_panel_count_row) + (y);
-    s_esp32_ws2812b_panel_rgb_buffer[counter].r = r; 
-    s_esp32_ws2812b_panel_rgb_buffer[counter].g = g;
-    s_esp32_ws2812b_panel_rgb_buffer[counter].b = b;
+    s_esp32_ws2812b_panel_rgb_buffer[counter].r = color.r; 
+    s_esp32_ws2812b_panel_rgb_buffer[counter].g = color.g;
+    s_esp32_ws2812b_panel_rgb_buffer[counter].b = color.b;
 
+    if(s_debug)
+    {
+        ets_printf(ESP32_WS2812B_PANEL_TAG" : set pixel (%u,%u)\n", x, y);
+    }
+    return true;
+}
+
+bool ESP32_WS2812B_PANEL_SetLineHorizontal(uint8_t x, 
+                                            uint8_t y, 
+                                            uint8_t len, 
+                                            s_esp32_ws2812b_panel_color_t color)
+{
+    //HORIZONTAL LINE STARTING FROM SPECIFIED CORDINATES
+    //OF SPECIFIED LENGTH AND COLOR
+
+    if(s_ongoing)
+    {
+        //IN MIDDLE OF REFRESHING
+        //DONT DISTURB BUFFER NOW
+        return false;
+    }
+
+    if(x >= s_esp32_ws2812b_panel_count_col ||
+        y >= s_esp32_ws2812b_panel_count_row ||
+        (x + len) >= s_esp32_ws2812b_panel_count_col)
+    {
+        //PIXEL OUT OF RANGE
+        return false;
+    }
+
+    for(uint8_t i = 0; i < len; i++)
+    {
+        ESP32_WS2812B_PANEL_SetPixel(x + i, y, color);
+    }
+    return true;
+}
+
+bool ESP32_WS2812B_PANEL_SetLineVertical(uint8_t x, 
+                                            uint8_t y, 
+                                            uint8_t len, 
+                                            s_esp32_ws2812b_panel_color_t color)
+{
+    //VERTICAL LINE STARTING FROM SPECIFIED CORDINATES
+    //OF SPECIFIED LENGTH AND COLOR
+
+    if(s_ongoing)
+    {
+        //IN MIDDLE OF REFRESHING
+        //DONT DISTURB BUFFER NOW
+        return false;
+    }
+
+    if(x >= s_esp32_ws2812b_panel_count_col ||
+        y >= s_esp32_ws2812b_panel_count_row ||
+        (y + len) >= s_esp32_ws2812b_panel_count_row)
+    {
+        //PIXEL OUT OF RANGE
+        return false;
+    }
+
+    for(uint8_t i = 0; i < len; i++)
+    {
+        ESP32_WS2812B_PANEL_SetPixel(x, y + i, color);
+    }
     return true;
 }
 
@@ -152,6 +212,12 @@ bool ESP32_WS2812B_PANEL_Clear(void)
     }
 
     //CLEAR PANEL
+    //DO IT COLUMNWISE
+    s_esp32_ws2812b_panel_color_t black = {0, 0, 0};
+    for(uint8_t i = 0; i < s_esp32_ws2812b_panel_count_col; i++)
+    {
+        ESP32_WS2812B_PANEL_SetLineVertical(0, i, s_esp32_ws2812b_panel_count_row, black);
+    }
 
     return true;
 }
@@ -162,17 +228,28 @@ void ESP32_WS28182B_PANEL_Refresh(void)
     //SEND THE WHOLE BUFFER OUT
 
     //BLOCK TILL LAST OPERATION COMPLETES
-    while(s_ongoing != false){};
+    while(s_ongoing){};
+    
+    s_ongoing = true;
+
+    //INITIALIZE RMT PIXEL WITH DEFAULT VALUES
+    for(uint8_t i = 0; i < 24; i++)
+    {
+        s_exp32_ws2812b_rmt_pixel[i].level0 = 1;
+        s_exp32_ws2812b_rmt_pixel[i].level1 = 0;
+        //MAKE BY DEFAULT ALL WS2812B BITS AS 0
+        s_exp32_ws2812b_rmt_pixel[i].duration0 = 1;
+        s_exp32_ws2812b_rmt_pixel[i].duration1 = 2;
+    }
 
     //START OPERATION
-    s_esp32_ws2812b_panel_next_coloumn = 0;
-    while(s_esp32_ws2812b_panel_next_coloumn < s_esp32_ws2812b_panel_count_col)
+    //SEND OUT DATA RGB PIXEL BY PIXEL
+    for(uint16_t m = 0; m < (s_esp32_ws2812b_panel_count_col * s_esp32_ws2812b_panel_count_row); m++)
     {
-        ets_printf(ESP32_WS2812B_PANEL_TAG"writing column %u\n", s_esp32_ws2812b_panel_next_coloumn);
-        s_esp32_ws2812b_panel_send_column(s_esp32_ws2812b_panel_next_coloumn);
-        while(rmt_wait_tx_done(0, 1000) != ESP_OK){};
-        s_esp32_ws2812b_panel_next_coloumn++;
+        s_esp32_ws2812b_panel_send_next_pixel();
     }
+
+    s_ongoing = false;
 
     if(s_debug)
     {
@@ -180,72 +257,176 @@ void ESP32_WS28182B_PANEL_Refresh(void)
     }
 }
 
-static void s_esp32_ws2812b_panel_send_column(uint8_t col)
+static void s_esp32_ws2812b_panel_send_next_pixel(void)
 {
-    //SEND THE BUFFER RELATED TO SPECIFIED COLUMN OUT
+    //SEND NEXT PIXEL OUT USING RMT PERIPHERAL
 
-    //FILL RMT BUFFER WITH COL DATA
-    for(uint16_t i = 0; i < s_esp32_ws2812b_panel_count_row; i++)
+    static uint32_t counter = 0;
+    uint8_t pixel_r = s_esp32_ws2812b_next_pixel_pointer->r;
+    uint8_t pixel_g = s_esp32_ws2812b_next_pixel_pointer->g;
+    uint8_t pixel_b = s_esp32_ws2812b_next_pixel_pointer->b;  
+
+    //NOW FILL IN ALL 1 BITS IN WS2812B BITS
+    //GREEN
+    if(pixel_g & 128)
     {
-        uint16_t counter = (i * 24);
-        uint8_t pixel_r = s_esp32_ws2812b_panel_rgb_buffer[(s_esp32_ws2812b_panel_count_row * col) + (i)].r;
-        uint8_t pixel_g = s_esp32_ws2812b_panel_rgb_buffer[(s_esp32_ws2812b_panel_count_row * col) + (i)].g;
-        uint8_t pixel_b = s_esp32_ws2812b_panel_rgb_buffer[(s_esp32_ws2812b_panel_count_row * col) + (i)].b;
-        for(int8_t j = 0; j <= 7; j++)
-        {
-            if(pixel_b & (1 << (7-j)))
-            {
-                //1
-                s_esp32_ws2812b_panel_buffer[counter + j].level0 = 1;
-                s_esp32_ws2812b_panel_buffer[counter + j].duration0 = 2;
-                s_esp32_ws2812b_panel_buffer[counter + j].level1 = 0;
-                s_esp32_ws2812b_panel_buffer[counter + j].duration1 = 1;
-            }
-            else
-            {
-                //0
-                s_esp32_ws2812b_panel_buffer[counter + j].level0 = 1;
-                s_esp32_ws2812b_panel_buffer[counter + j].duration0 = 1;
-                s_esp32_ws2812b_panel_buffer[counter + j].level1 = 0;
-                s_esp32_ws2812b_panel_buffer[counter + j].duration1 = 2;
-            }
-
-            if(pixel_r & (1 << (7-j)))
-            {
-                //1
-                s_esp32_ws2812b_panel_buffer[8 + counter + j].level0 = 1;
-                s_esp32_ws2812b_panel_buffer[8 + counter + j].duration0 = 2;
-                s_esp32_ws2812b_panel_buffer[8 + counter + j].level1 = 0;
-                s_esp32_ws2812b_panel_buffer[8 + counter + j].duration1 = 1;
-            }
-            else
-            {
-                //0
-                s_esp32_ws2812b_panel_buffer[8 + counter + j].level0 = 1;
-                s_esp32_ws2812b_panel_buffer[8 + counter + j].duration0 = 1;
-                s_esp32_ws2812b_panel_buffer[8 + counter + j].level1 = 0;
-                s_esp32_ws2812b_panel_buffer[8 + counter + j].duration1 = 2;
-            }
-
-            if(pixel_g & (1 << (7-j)))
-            {
-                //1
-                s_esp32_ws2812b_panel_buffer[16 + counter + j].level0 = 1;
-                s_esp32_ws2812b_panel_buffer[16 + counter + j].duration0 = 2;
-                s_esp32_ws2812b_panel_buffer[16 + counter + j].level1 = 0;
-                s_esp32_ws2812b_panel_buffer[16 + counter + j].duration1 = 1;
-            }
-            else
-            {
-                //0
-                s_esp32_ws2812b_panel_buffer[16 + counter + j].level0 = 1;
-                s_esp32_ws2812b_panel_buffer[16 + counter + j].duration0 = 1;
-                s_esp32_ws2812b_panel_buffer[16 + counter + j].level1 = 0;
-                s_esp32_ws2812b_panel_buffer[16 + counter + j].duration1 = 2;
-            }
-        }
+        //1
+        s_exp32_ws2812b_rmt_pixel[0].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[0].duration1 = 1;
+    }
+    if(pixel_g & 64)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[1].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[1].duration1 = 1;
+    }
+    if(pixel_g & 32)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[2].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[2].duration1 = 1;
+    }
+    if(pixel_g & 16)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[3].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[3].duration1 = 1;
+    }
+    if(pixel_g & 8)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[4].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[4].duration1 = 1;
+    }
+    if(pixel_g & 4)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[5].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[5].duration1 = 1;
+    }
+    if(pixel_g & 2)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[6].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[6].duration1 = 1;
+    }
+    if(pixel_g & 1)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[7].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[7].duration1 = 1;
     }
 
-    //SEND DATA OUT
-    rmt_write_items(0, s_esp32_ws2812b_panel_buffer, (24 * s_esp32_ws2812b_panel_count_row), 1);
+    //RED
+    if(pixel_r & 128)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[8].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[8].duration1 = 1;
+    }
+    if(pixel_r & 64)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[9].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[9].duration1 = 1;
+    }
+    if(pixel_r & 32)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[10].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[10].duration1 = 1;
+    }
+    if(pixel_r & 16)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[11].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[11].duration1 = 1;
+    }
+    if(pixel_r & 8)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[12].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[12].duration1 = 1;
+    }
+    if(pixel_r & 4)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[13].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[13].duration1 = 1;
+    }
+    if(pixel_r & 2)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[14].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[14].duration1 = 1;
+    }
+    if(pixel_r & 1)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[15].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[15].duration1 = 1;
+    }
+
+    //BLUE
+    if(pixel_b & 128)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[16].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[16].duration1 = 1;
+    }
+    if(pixel_b & 64)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[17].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[17].duration1 = 1;
+    }
+    if(pixel_b & 32)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[18].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[18].duration1 = 1;
+    }
+    if(pixel_b & 16)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[19].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[19].duration1 = 1;
+    }
+    if(pixel_b & 8)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[20].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[20].duration1 = 1;
+    }
+    if(pixel_b & 4)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[21].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[21].duration1 = 1;
+    }
+    if(pixel_b & 2)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[22].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[22].duration1 = 1;
+    }
+    if(pixel_b & 1)
+    {
+        //1
+        s_exp32_ws2812b_rmt_pixel[23].duration0 = 2;
+        s_exp32_ws2812b_rmt_pixel[23].duration1 = 1;
+    }
+
+    //SEND OUT THE PIXEL IN BLOCKING MODE
+    rmt_write_items(0, s_exp32_ws2812b_rmt_pixel, 24, false);
+
+    //MODIFY COUNTERS FOR NEXT WRITE
+    s_esp32_ws2812b_next_pixel_pointer++;
+    counter++;
+    if(counter >= (s_esp32_ws2812b_panel_count_row * s_esp32_ws2812b_panel_count_col))
+    {
+        //ALL PIXELS SENT
+        //RESET PIX_POINTER
+        s_esp32_ws2812b_next_pixel_pointer = &s_esp32_ws2812b_panel_rgb_buffer[0];
+    }
 }
