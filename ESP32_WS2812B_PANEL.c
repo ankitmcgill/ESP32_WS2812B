@@ -1,5 +1,4 @@
 //////////////////////////////////////////////////////////////////
-//////////////////////////////////////////////////////////////////
 // ESP32 - WS2812B PANEL
 //
 // WS2812B RGB LED PANEL DRIVER
@@ -19,6 +18,9 @@
 //
 //        https://wp.josh.com/2014/05/13/ws2812-neopixels-are-not-so-finicky-once-you-get-to-know-them/
 //
+//        BITMAP FONTS
+//        http://jared.geek.nz/2014/jan/custom-fonts-for-microcontrollers
+//
 // APRIL 30, 2018
 //
 // ANKIT BHATNAGAR
@@ -28,6 +30,7 @@
 #include "ESP32_WS2812B_PANEL.h"
 #include "driver/rmt.h"
 #include "esp_intr.h"
+#include "homespun_font.h"
 
 //INTERNAL VARIABLES
 static bool s_debug;
@@ -238,6 +241,132 @@ bool ESP32_WS2812B_PANEL_SetBoxFilled(uint8_t x,
     }
 
     return retval;
+}
+
+bool ESP32_WS2812B_PANEL_WriteStringXY(uint8_t x,
+                                        uint8_t y,
+                                        char* str,
+                                        uint8_t str_len,
+                                        s_esp32_ws2812b_panel_color_t color)
+{
+    //WRITE THE SPECIFIED STRING OF SPECIFIED LENGTH
+    //AT THE SPECIFIED CORDINATES
+    //FONT USED = 6(WIDTH) x 8(HEIGHT)
+
+    if(s_ongoing)
+    {
+        //IN MIDDLE OF REFRESHING
+        //DONT DISTURB BUFFER NOW
+        return false;
+    }
+
+    if(x >= s_esp32_ws2812b_panel_count_col ||
+        y >= s_esp32_ws2812b_panel_count_row)
+    {
+        //PIXEL OUT OF RANGE
+        return false;
+    }
+
+    uint8_t x_start;
+    uint8_t curr_char;
+
+    x_start = x;
+    for(uint8_t i = 0; i < str_len; i++)
+    {
+        
+        curr_char = str[i];
+        for(uint8_t j = 0; j < font_width[curr_char - 32]; j++)
+        {
+            if(font[curr_char - 32][j] & 1)
+            {
+                ESP32_WS2812B_PANEL_SetPixel(x_start, y + 0, color);
+            }
+            if(font[curr_char - 32][j] & 2)
+            {
+                ESP32_WS2812B_PANEL_SetPixel(x_start, y + 1, color);
+            }
+            if(font[curr_char - 32][j] & 4)
+            {
+                ESP32_WS2812B_PANEL_SetPixel(x_start, y + 2, color);
+            }
+            if(font[curr_char - 32][j] & 8)
+            {
+                ESP32_WS2812B_PANEL_SetPixel(x_start, y + 3, color);
+            }
+            if(font[curr_char - 32][j] & 16)
+            {
+                ESP32_WS2812B_PANEL_SetPixel(x_start, y + 4, color);
+            }
+            if(font[curr_char - 32][j] & 32)
+            {
+                ESP32_WS2812B_PANEL_SetPixel(x_start, y + 5, color);
+            }
+            if(font[curr_char - 32][j] & 64)
+            {
+                ESP32_WS2812B_PANEL_SetPixel(x_start, y + 6, color);
+            }
+            if(font[curr_char - 32][j] & 128)
+            {
+                ESP32_WS2812B_PANEL_SetPixel(x_start, y + 7, color);
+            }
+            x_start++;
+        }
+        x_start++;
+    }
+    return true;
+}
+
+bool ESP32_WS2812B_PANEL_WriteStringJustified(esp32_ws2812b_panel_justify_t justify,
+                                                char* str,
+                                                uint8_t str_len,
+                                                s_esp32_ws2812b_panel_color_t color)
+{
+    //WRITE SPECIFIED STRING WITH SPECIFIED JUSTIFICATION RELATIVE
+    //TO THE PANEL
+
+    if(justify >= ESP32_WS2812B_PANEL_JUSTIFY_MAX)
+    {
+        //WRONG JUSTIFICATION
+        return false;
+    }
+
+    //CALCULATE STARTING x,y BASED ON STRING AND JUSTIFICATION
+    uint8_t x = 0;
+    uint8_t y = 0;
+    uint8_t string_width = 0;
+    y = 0;
+
+    for(uint8_t i = 0; i < str_len; i++)
+    {
+        string_width += font_width[str[i] - 32] + 1;
+    }
+    string_width--;
+
+    if(string_width > s_esp32_ws2812b_panel_count_col)
+    {
+        //STRING WONT FIT
+        return false;
+    }
+
+    switch(justify)
+    {
+        case ESP32_WS2812B_PANEL_JUSTIFY_LEFT:
+            x = 0;
+            break;
+        
+        case ESP32_WS2812B_PANEL_JUSTIFY_CENTRE:
+            x = (s_esp32_ws2812b_panel_count_col - string_width ) / 2;
+            break;
+        
+        case ESP32_WS2812B_PANEL_JUSTIFY_RIGHT:
+            x = s_esp32_ws2812b_panel_count_col - string_width;
+            break;
+        
+        default:
+            break;
+    }
+
+    return ESP32_WS2812B_PANEL_WriteStringXY(x, y, str, str_len, color);
 }
 
 bool ESP32_WS2812B_PANEL_Clear(void)

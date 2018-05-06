@@ -18,6 +18,9 @@
 //
 //        https://wp.josh.com/2014/05/13/ws2812-neopixels-are-not-so-finicky-once-you-get-to-know-them/
 //
+//        BITMAP FONTS
+//        http://jared.geek.nz/2014/jan/custom-fonts-for-microcontrollers
+//
 // APRIL 30, 2018
 //
 // ANKIT BHATNAGAR
@@ -32,8 +35,15 @@
 #include "esp_log.h"
 
 #define ESP32_WS2812B_PANEL_TAG         "ESP32:WS2812B_PANEL"
-
 #define ESP32_WS2812B_PANEL_ROW_MAX     (31)
+
+typedef enum
+{
+    ESP32_WS2812B_PANEL_JUSTIFY_LEFT = 0,
+    ESP32_WS2812B_PANEL_JUSTIFY_CENTRE,
+    ESP32_WS2812B_PANEL_JUSTIFY_RIGHT,
+    ESP32_WS2812B_PANEL_JUSTIFY_MAX
+}esp32_ws2812b_panel_justify_t;
 
 typedef struct
 {
@@ -66,7 +76,15 @@ bool ESP32_WS2812B_PANEL_SetBoxFilled(uint8_t x,
                                         uint8_t width, 
                                         uint8_t height,
                                         s_esp32_ws2812b_panel_color_t color);
-
+bool ESP32_WS2812B_PANEL_WriteStringXY(uint8_t x,
+                                        uint8_t y,
+                                        char* str,
+                                        uint8_t str_len,
+                                        s_esp32_ws2812b_panel_color_t color);
+bool ESP32_WS2812B_PANEL_WriteStringJustified(esp32_ws2812b_panel_justify_t justify,
+                                                char* str,
+                                                uint8_t str_len,
+                                                s_esp32_ws2812b_panel_color_t color);
 bool ESP32_WS2812B_PANEL_Clear(void);
 void ESP32_WS28182B_PANEL_Refresh(void);
 
