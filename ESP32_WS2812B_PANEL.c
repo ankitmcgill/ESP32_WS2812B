@@ -454,6 +454,7 @@ static void s_esp32_ws2812b_panel_send_next_pixel(void)
     {
         //ALL PIXELS SENT
         //RESET PIX_POINTER
+        counter = 0;
         s_esp32_ws2812b_next_pixel_pointer = &s_esp32_ws2812b_panel_rgb_buffer[0];
     }
 }
