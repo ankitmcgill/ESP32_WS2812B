@@ -237,7 +237,7 @@ bool ESP32_WS2812B_PANEL_SetBoxFilled(uint8_t x,
 
     for(uint8_t i = 0; i < height; i++)
     {
-        retval &= ESP32_WS2812B_PANEL_SetLineHorizontal(x, y, width, color);
+        retval &= ESP32_WS2812B_PANEL_SetLineHorizontal(x, y + i, width, color);
     }
 
     return retval;
