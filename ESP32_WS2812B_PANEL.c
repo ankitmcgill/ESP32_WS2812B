@@ -222,6 +222,24 @@ bool ESP32_WS2812B_PANEL_SetBoxOutline(uint8_t x,
     return retval;
 }
 
+bool ESP32_WS2812B_PANEL_SetBoxFilled(uint8_t x, 
+                                        uint8_t y, 
+                                        uint8_t width, 
+                                        uint8_t height,
+                                        s_esp32_ws2812b_panel_color_t color)
+{
+    //SET BOX FILLED WITH SPECIFIED CORNER AND WIDTH AND HEIGHT
+
+    bool retval = true;
+
+    for(uint8_t i = 0; i < height; i++)
+    {
+        retval &= ESP32_WS2812B_PANEL_SetLineHorizontal(x, y, width, color);
+    }
+
+    return retval;
+}
+
 bool ESP32_WS2812B_PANEL_Clear(void)
 {
     //CLEAR PANEL
