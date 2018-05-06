@@ -56,6 +56,11 @@ bool ESP32_WS2812B_PANEL_SetLineVertical(uint8_t x,
                                             uint8_t y, 
                                             uint8_t len, 
                                             s_esp32_ws2812b_panel_color_t color);
+bool ESP32_WS2812B_PANEL_SetBoxOutline(uint8_t x, 
+                                        uint8_t y, 
+                                        uint8_t width, 
+                                        uint8_t height,
+                                        s_esp32_ws2812b_panel_color_t color);
 bool ESP32_WS2812B_PANEL_Clear(void);
 
 void ESP32_WS28182B_PANEL_Refresh(void);

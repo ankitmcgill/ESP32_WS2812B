@@ -44,6 +44,7 @@ static rmt_item32_t s_exp32_ws2812b_rmt_pixel[24];
 
 //INTERNAL FUNCTIONS
 static void s_esp32_ws2812b_panel_send_next_pixel(void);
+static uint16_t s_esp32_ws2812b_panel_cartesian_pixel_to_strip_index(uint8_t x, uint8_t y);
 
 void ESP32_WS2812B_PANEL_SetDebug(bool enable)
 {
@@ -94,7 +95,7 @@ void ESP32_WS2812B_PANEL_Initialize(uint8_t rows, uint8_t columns, uint8_t data_
     config.tx_config.carrier_duty_percent = 50;
     config.tx_config.carrier_freq_hz = 10000;
     config.tx_config.carrier_level = 1;
-    config.clk_div = 24;
+    config.clk_div = 28;
     ets_printf(ESP32_WS2812B_PANEL_TAG" : RMT initialized\n");
 
     //START ESP32 RMT
@@ -128,10 +129,13 @@ bool ESP32_WS2812B_PANEL_SetPixel(uint8_t x,
         return false;
     }
 
-    uint32_t counter = (x * s_esp32_ws2812b_panel_count_row) + (y);
-    s_esp32_ws2812b_panel_rgb_buffer[counter].r = color.r; 
-    s_esp32_ws2812b_panel_rgb_buffer[counter].g = color.g;
-    s_esp32_ws2812b_panel_rgb_buffer[counter].b = color.b;
+    //COMVERT CARTESIAN PIXEL TO WS2812B STRIP INDEX
+    uint16_t index = s_esp32_ws2812b_panel_cartesian_pixel_to_strip_index(x, y);
+
+    ets_printf("index = %u\n", index);
+    s_esp32_ws2812b_panel_rgb_buffer[index].r = color.r; 
+    s_esp32_ws2812b_panel_rgb_buffer[index].g = color.g;
+    s_esp32_ws2812b_panel_rgb_buffer[index].b = color.b;
 
     if(s_debug)
     {
@@ -157,7 +161,7 @@ bool ESP32_WS2812B_PANEL_SetLineHorizontal(uint8_t x,
 
     if(x >= s_esp32_ws2812b_panel_count_col ||
         y >= s_esp32_ws2812b_panel_count_row ||
-        (x + len) >= s_esp32_ws2812b_panel_count_col)
+        (x + len) > s_esp32_ws2812b_panel_count_col)
     {
         //PIXEL OUT OF RANGE
         return false;
@@ -187,7 +191,7 @@ bool ESP32_WS2812B_PANEL_SetLineVertical(uint8_t x,
 
     if(x >= s_esp32_ws2812b_panel_count_col ||
         y >= s_esp32_ws2812b_panel_count_row ||
-        (y + len) >= s_esp32_ws2812b_panel_count_row)
+        (y + len) > s_esp32_ws2812b_panel_count_row)
     {
         //PIXEL OUT OF RANGE
         return false;
@@ -198,6 +202,24 @@ bool ESP32_WS2812B_PANEL_SetLineVertical(uint8_t x,
         ESP32_WS2812B_PANEL_SetPixel(x, y + i, color);
     }
     return true;
+}
+
+bool ESP32_WS2812B_PANEL_SetBoxOutline(uint8_t x, 
+                                        uint8_t y, 
+                                        uint8_t width, 
+                                        uint8_t height,
+                                        s_esp32_ws2812b_panel_color_t color)
+{
+    //SET BOX OUTLINE WITH SPECIFIED CORNER AND WIDTH AND HEIGHT
+
+    bool retval = true;
+
+    retval &= ESP32_WS2812B_PANEL_SetLineVertical(x, y, height, color);
+    retval &= ESP32_WS2812B_PANEL_SetLineVertical(x + width - 1, y, height, color);
+    retval &= ESP32_WS2812B_PANEL_SetLineHorizontal(x, y, width, color);
+    retval &= ESP32_WS2812B_PANEL_SetLineHorizontal(x, y + height - 1, width, color);
+
+    return retval;
 }
 
 bool ESP32_WS2812B_PANEL_Clear(void)
@@ -212,11 +234,17 @@ bool ESP32_WS2812B_PANEL_Clear(void)
     }
 
     //CLEAR PANEL
-    //DO IT COLUMNWISE
     s_esp32_ws2812b_panel_color_t black = {0, 0, 0};
-    for(uint8_t i = 0; i < s_esp32_ws2812b_panel_count_col; i++)
+    for(uint16_t i = 0; i < (s_esp32_ws2812b_panel_count_col * s_esp32_ws2812b_panel_count_row); i++)
     {
-        ESP32_WS2812B_PANEL_SetLineVertical(0, i, s_esp32_ws2812b_panel_count_row, black);
+        s_esp32_ws2812b_panel_rgb_buffer[i].r = 0;
+        s_esp32_ws2812b_panel_rgb_buffer[i].g = 0;
+        s_esp32_ws2812b_panel_rgb_buffer[i].b = 0;
+    }
+
+    if(s_debug)
+    {
+        ets_printf(ESP32_WS2812B_PANEL_TAG" : clear\n");
     }
 
     return true;
@@ -231,16 +259,6 @@ void ESP32_WS28182B_PANEL_Refresh(void)
     while(s_ongoing){};
     
     s_ongoing = true;
-
-    //INITIALIZE RMT PIXEL WITH DEFAULT VALUES
-    for(uint8_t i = 0; i < 24; i++)
-    {
-        s_exp32_ws2812b_rmt_pixel[i].level0 = 1;
-        s_exp32_ws2812b_rmt_pixel[i].level1 = 0;
-        //MAKE BY DEFAULT ALL WS2812B BITS AS 0
-        s_exp32_ws2812b_rmt_pixel[i].duration0 = 1;
-        s_exp32_ws2812b_rmt_pixel[i].duration1 = 2;
-    }
 
     //START OPERATION
     //SEND OUT DATA RGB PIXEL BY PIXEL
@@ -265,6 +283,16 @@ static void s_esp32_ws2812b_panel_send_next_pixel(void)
     uint8_t pixel_r = s_esp32_ws2812b_next_pixel_pointer->r;
     uint8_t pixel_g = s_esp32_ws2812b_next_pixel_pointer->g;
     uint8_t pixel_b = s_esp32_ws2812b_next_pixel_pointer->b;  
+
+    //INITIALIZE RMT PIXEL WITH DEFAULT VALUES
+    for(uint8_t i = 0; i < 24; i++)
+    {
+        s_exp32_ws2812b_rmt_pixel[i].level0 = 1;
+        s_exp32_ws2812b_rmt_pixel[i].level1 = 0;
+        //MAKE BY DEFAULT ALL WS2812B BITS AS 0
+        s_exp32_ws2812b_rmt_pixel[i].duration0 = 1;
+        s_exp32_ws2812b_rmt_pixel[i].duration1 = 2;
+    }
 
     //NOW FILL IN ALL 1 BITS IN WS2812B BITS
     //GREEN
@@ -429,4 +457,21 @@ static void s_esp32_ws2812b_panel_send_next_pixel(void)
         //RESET PIX_POINTER
         s_esp32_ws2812b_next_pixel_pointer = &s_esp32_ws2812b_panel_rgb_buffer[0];
     }
+}
+
+static uint16_t s_esp32_ws2812b_panel_cartesian_pixel_to_strip_index(uint8_t x, uint8_t y)
+{
+    //CONVERT CARTESION COORDINATE TO WS2812B STRIP INDEX
+
+    uint16_t retval;
+
+    if((x % 2) == 0)
+    {
+        retval = (s_esp32_ws2812b_panel_count_row * x) + y;
+    }
+    else
+    {
+        retval = (s_esp32_ws2812b_panel_count_row * x) + (s_esp32_ws2812b_panel_count_row - y) - 1;
+    }
+    return retval;
 }
