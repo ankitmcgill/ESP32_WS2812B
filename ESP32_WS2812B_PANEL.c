@@ -90,10 +90,10 @@ void ESP32_WS2812B_PANEL_Initialize(uint8_t rows, uint8_t columns, uint8_t data_
 
     uint16_t s_esp32_ws2812b_panel_blocksize = ((rows * 24) / 64) + 1;
 
-    config.mem_block_num = s_esp32_ws2812b_panel_blocksize;
+    config.mem_block_num = 1;
     config.tx_config.loop_en = 0;
     config.tx_config.carrier_en = 0;
-    config.tx_config.idle_output_en = 1;
+    config.tx_config.idle_output_en = 0;
     config.tx_config.idle_level = 0;
     config.tx_config.carrier_duty_percent = 50;
     config.tx_config.carrier_freq_hz = 10000;
@@ -134,15 +134,13 @@ bool ESP32_WS2812B_PANEL_SetPixel(uint8_t x,
 
     //CONVERT CARTESIAN PIXEL TO WS2812B STRIP INDEX
     uint16_t index = s_esp32_ws2812b_panel_cartesian_pixel_to_strip_index(x, y);
-
-    ets_printf("index = %u\n", index);
     s_esp32_ws2812b_panel_rgb_buffer[index].r = color.r; 
     s_esp32_ws2812b_panel_rgb_buffer[index].g = color.g;
     s_esp32_ws2812b_panel_rgb_buffer[index].b = color.b;
 
     if(s_debug)
     {
-        ets_printf(ESP32_WS2812B_PANEL_TAG" : set pixel (%u,%u)\n", x, y);
+        ets_printf(ESP32_WS2812B_PANEL_TAG" : set pixel (%u,%u). index = %u\n", x, y, index);
     }
     return true;
 }
