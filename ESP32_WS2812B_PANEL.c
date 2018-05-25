@@ -13,10 +13,11 @@
 //          
 //        NEIL KOLBAN ESP32 BOOK
 //        SECTION = RMT
-//
 //        https://github.com/nkolban/esp32-snippets/blob/master/rmt/fragments/rmt_simple.c
-//
 //        https://wp.josh.com/2014/05/13/ws2812-neopixels-are-not-so-finicky-once-you-get-to-know-them/
+//
+//        DOUBLE BUFFERRING
+//        http://gameprogrammingpatterns.com/double-buffer.html
 //
 //        BITMAP FONTS
 //        http://jared.geek.nz/2014/jan/custom-fonts-for-microcontrollers
@@ -28,25 +29,45 @@
 //////////////////////////////////////////////////////////////////
 
 #include "ESP32_WS2812B_PANEL.h"
+#include "ESP32_UTIL.h"
 #include "driver/rmt.h"
+#include "soc/rmt_struct.h"
+#include "soc/dport_reg.h"
+#include "driver/gpio.h"
+#include "soc/gpio_sig_map.h"
 #include "esp_intr.h"
 #include "homespun_font.h"
 
+#define ESP32_WS28122B_PANEL_RMT_DATA_THRESHOLD_LIMIT   (32)
+
 //INTERNAL VARIABLES
 static bool s_debug;
-static bool s_ongoing;
+static volatile bool s_frame_dirty;
+static volatile bool s_frame_rendering;
+
+//INTERRUPT RELATED
+static intr_handle_t s_esp32_ws2812b_panel_rmt_int_handle;
 
 //DISPLAY RELATED
+static uint8_t s_esp32_ws2812b_panel_data_gpio;
 static uint8_t s_esp32_ws2812b_panel_count_row;
 static uint8_t s_esp32_ws2812b_panel_count_col;
 
 //BUFFER RELATED
-static s_esp32_ws2812b_panel_color_t* s_esp32_ws2812b_panel_rgb_buffer;
-static s_esp32_ws2812b_panel_color_t* s_esp32_ws2812b_next_pixel_pointer;
-static rmt_item32_t s_exp32_ws2812b_rmt_pixel[24];
+static uint8_t* s_esp32_ws2812b_panel_framebuffer_1;
+static uint8_t* s_esp32_ws2812b_panel_framebuffer_2;
+static uint8_t* s_esp32_ws2812b_panel_framebuffer_pointer[2];
+static uint8_t s_esp32_ws2812b_panel_active_framebuffer_num;
+static volatile uint32_t s_esp32_ws2812b_panel_framebuffer_data_counter;
+static uint16_t s_esp32_ws2812b_panel_framebuffer_total_bytes;
+static volatile bool s_esp32_ws2812b_panel_half_copy_pointer;
 
 //INTERNAL FUNCTIONS
-static void s_esp32_ws2812b_panel_send_next_pixel(void);
+static void s_esp32_ws2812b_panel_rmt_isr(void* arg);
+static void s_esp32_ws2812b_panel_reset(void);
+static void s_esp32_ws2812b_panel_switch_framebuffer(void);
+static void s_esp32_ws2812b_panel_copy_full_buffer(void);
+static void s_esp32_ws2812b_panel_copy_half_buffer(bool at_beginning);
 static uint16_t s_esp32_ws2812b_panel_cartesian_pixel_to_strip_index(uint8_t x, uint8_t y);
 
 void ESP32_WS2812B_PANEL_SetDebug(bool enable)
@@ -63,8 +84,6 @@ void ESP32_WS2812B_PANEL_Initialize(uint8_t rows, uint8_t columns, uint8_t data_
     //CLOCK DIVIDER = 28
     //WS2812B PIXEL = 3 WS2812B BYTES = 24 WS2812B BITS
     //1 WS2812B BIT = 2 RMT DATA ITEM = 1 RMT_ITEM32_T
-    //MAX LIMIT OF RMT_ITEM32_T = 8 * 64 = 512 => 512 WS2812B BITS = 64 WS2812B BYTES ~ 31 WS2812B PIXELS
-    //SINCE WE HANDLE PANEL COLUMN WISE, COLUMN <= 31
 
     if(rows > ESP32_WS2812B_PANEL_ROW_MAX)
     {
@@ -74,73 +93,165 @@ void ESP32_WS2812B_PANEL_Initialize(uint8_t rows, uint8_t columns, uint8_t data_
 
     s_esp32_ws2812b_panel_count_row = rows;
     s_esp32_ws2812b_panel_count_col = columns;
+    s_esp32_ws2812b_panel_data_gpio = data_gpio;
 
     //ALLOCATE BUFFERS
-    s_esp32_ws2812b_panel_rgb_buffer = (s_esp32_ws2812b_panel_color_t*)calloc((rows * columns), 
-                                                                sizeof(s_esp32_ws2812b_panel_color_t));
+    s_esp32_ws2812b_panel_framebuffer_1 = (uint8_t*)calloc((rows * columns * 3), 
+                                                                sizeof(uint8_t));
+    s_esp32_ws2812b_panel_framebuffer_2 = (uint8_t*)calloc((rows * columns * 3), 
+                                                                sizeof(uint8_t));
+    s_esp32_ws2812b_panel_framebuffer_pointer[0] = s_esp32_ws2812b_panel_framebuffer_1;
+    s_esp32_ws2812b_panel_framebuffer_pointer[1] = s_esp32_ws2812b_panel_framebuffer_2;
+    s_esp32_ws2812b_panel_active_framebuffer_num = 0;
+    s_esp32_ws2812b_panel_framebuffer_data_counter = 0;
+    s_esp32_ws2812b_panel_framebuffer_total_bytes = (3 * rows * columns);
 
-    s_esp32_ws2812b_next_pixel_pointer = &s_esp32_ws2812b_panel_rgb_buffer[0];
-    s_ongoing = false;
+    s_frame_rendering = false;
+    s_esp32_ws2812b_panel_half_copy_pointer = true;
+    s_frame_dirty = false;
 
-    //CONFIGURE ESP32 RMT
-    rmt_config_t config;
-    config.rmt_mode = RMT_MODE_TX;
-    config.channel = RMT_CHANNEL_0;
-    config.gpio_num = data_gpio;
+    /*
+    //RESET & START RMT PERIPHERAL
+    //ENABLE CLOCK TO RMT
+    DPORT_SET_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG, DPORT_RMT_CLK_EN);
+    DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_RMT_RST);
 
-    uint16_t s_esp32_ws2812b_panel_blocksize = ((rows * 24) / 64) + 1;
+    //SETUP RMT GPIO
+    PIN_FUNC_SELECT(GPIO_PIN_MUX_REG[data_gpio], 2);
+    gpio_matrix_out(data_gpio, RMT_SIG_OUT0_IDX + 0, 0, 0);
+    gpio_set_direction(data_gpio, GPIO_MODE_OUTPUT);
 
-    config.mem_block_num = 1;
-    config.tx_config.loop_en = 0;
-    config.tx_config.carrier_en = 0;
-    config.tx_config.idle_output_en = 0;
-    config.tx_config.idle_level = 0;
-    config.tx_config.carrier_duty_percent = 50;
-    config.tx_config.carrier_freq_hz = 10000;
-    config.tx_config.carrier_level = 1;
-    config.clk_div = 28;
-    ets_printf(ESP32_WS2812B_PANEL_TAG" : RMT initialized\n");
+    //INITIALIZE RMT PERIPHERAL
+    RMT.apb_conf.fifo_mask = 1;
+    RMT.apb_conf.mem_tx_wrap_en = 1;
+    RMT.conf_ch[0].conf0.div_cnt = ESP32_WS28122B_PANEL_RMT_DIVIDER;
+    RMT.conf_ch[0].conf0.mem_size = 1;
+    RMT.conf_ch[0].conf0.carrier_en = 0;
+    RMT.conf_ch[0].conf0.carrier_out_lv = 1;
+    RMT.conf_ch[0].conf0.mem_pd = 0;
 
-    //START ESP32 RMT
-    ESP_ERROR_CHECK(rmt_config(&config));
-    ESP_ERROR_CHECK(rmt_driver_install(config.channel, 0, 0));
-    ets_printf(ESP32_WS2812B_PANEL_TAG" : RMT started\n");
+    RMT.conf_ch[0].conf1.rx_en = 0;
+    RMT.conf_ch[0].conf1.mem_owner = 0;
+    RMT.conf_ch[0].conf1.tx_conti_mode = 0;
+    RMT.conf_ch[0].conf1.ref_always_on = 1;
+    RMT.conf_ch[0].conf1.idle_out_en = 1;
+    RMT.conf_ch[0].conf1.idle_out_lv = 0;
+    */
 
-    ets_printf(ESP32_WS2812B_PANEL_TAG" : Initialized. Rows = %u, Columns = %u, DIN gpio = %u\n",
+    //SET RMT CONFIG
+    //CAN USE PROVIDED RMT_DRIVER FOR THIS
+    rmt_config_t rconfig;
+
+    rconfig.rmt_mode = RMT_MODE_TX;
+    rconfig.channel = 0;
+    rconfig.gpio_num = data_gpio;
+    rconfig.clk_div = ESP32_WS28122B_PANEL_RMT_DIVIDER;
+    rconfig.mem_block_num = 1;
+    
+    rconfig.tx_config.loop_en = 0;
+    rconfig.tx_config.idle_output_en = 0;
+    rconfig.tx_config.idle_level = 0;
+
+    rconfig.tx_config.carrier_en = 0;
+    rconfig.tx_config.carrier_duty_percent = 50;
+    rconfig.tx_config.carrier_freq_hz = 10000;
+    rconfig.tx_config.carrier_level = 1;
+
+    //INIT RMT
+    ESP_ERROR_CHECK(rmt_config(&rconfig));
+
+    //SETUP RMT INTERRUPT
+    //CANNOT USE DRIVER FOR IT OR rmt_driver_install
+    RMT.apb_conf.mem_tx_wrap_en = 1;
+    RMT.tx_lim_ch[0].limit = ESP32_WS28122B_PANEL_RMT_DATA_THRESHOLD_LIMIT;
+    RMT.int_ena.ch0_tx_thr_event = 1;
+    RMT.int_ena.ch0_tx_end = 1;
+    esp_intr_alloc(ETS_RMT_INTR_SOURCE, 0, s_esp32_ws2812b_panel_rmt_isr, NULL, &s_esp32_ws2812b_panel_rmt_int_handle);
+
+    ets_printf(ESP32_WS2812B_PANEL_TAG" : Initialized Panel %ux%u, data_gpio = %u\n",
                                                                         s_esp32_ws2812b_panel_count_row,
                                                                         s_esp32_ws2812b_panel_count_col,
                                                                         data_gpio);
+    
+    //RESET THE PANEL
+    //s_esp32_ws2812b_panel_reset();
+}
+
+void ESP32_WS28182B_PANEL_RenderFrame(void)
+{
+    //RENDER THE INACTIVE FRAME BUFFER
+
+    static uint8_t ctr = 0;
+
+    //WAIT FOR ONGOING RENDERING JOB TO FINISH
+    if(s_frame_rendering)
+    {
+        return;
+    }
+
+    ctr++;
+    if(ctr == 3)
+    {
+        while(1){}
+    }
+    
+    //RENDER ONLY IF FRAME DIRTY
+    if(!s_frame_dirty)
+    {
+        return;
+    }
+    s_frame_dirty = false;
+
+    ets_printf("start frame rendering %u\n", !s_esp32_ws2812b_panel_active_framebuffer_num);
+
+    //CLEAR ALL EVENTS
+    RMT.int_clr.ch0_tx_thr_event = 1;
+    RMT.int_clr.ch0_tx_end = 1;
+
+    //ENABLE RMT THR EVENT
+    RMT.int_ena.ch0_tx_thr_event = 1;
+    RMT.int_ena.ch0_tx_end = 1;
+
+    //START NEW FRAME RENDERING
+    s_frame_rendering = true;
+    s_esp32_ws2812b_panel_half_copy_pointer = true;
+    s_esp32_ws2812b_panel_framebuffer_data_counter = 0;
+    
+    //COPY FIRST FULL RMT DATA BUFFER
+    s_esp32_ws2812b_panel_copy_full_buffer();
+    
+    //START RMT TRANSACTION
+    RMT.conf_ch[0].conf1.mem_rd_rst = 1;
+    RMT.conf_ch[0].conf1.tx_start = 1;
 }
 
 bool ESP32_WS2812B_PANEL_SetPixel(uint8_t x, 
                                     uint8_t y, 
                                     s_esp32_ws2812b_panel_color_t color)
 {
-    //SET PIXEL IN THE INTERNAL BUFFER WITH SPECIFIED COLOR
-
-    if(s_ongoing)
-    {
-        //IN MIDDLE OF REFRESHING
-        //DONT DISTURB BUFFER NOW
-        return false;
-    }
+    //SET PIXEL IN THE ACTIVE  FRAME BUFFER WITH SPECIFIED COLOR
+    //G, R, B FORMAT
 
     if(x >= s_esp32_ws2812b_panel_count_col ||
-        y >= s_esp32_ws2812b_panel_count_row)
+    y >= s_esp32_ws2812b_panel_count_row)
     {
         //PIXEL OUT OF RANGE
         return false;
     }
 
+    s_frame_dirty = true;
+
     //CONVERT CARTESIAN PIXEL TO WS2812B STRIP INDEX
     uint16_t index = s_esp32_ws2812b_panel_cartesian_pixel_to_strip_index(x, y);
-    s_esp32_ws2812b_panel_rgb_buffer[index].r = color.r; 
-    s_esp32_ws2812b_panel_rgb_buffer[index].g = color.g;
-    s_esp32_ws2812b_panel_rgb_buffer[index].b = color.b;
+    
+    //STORE DATA IN FRAMEBUFFER AS G, R, B
+    s_esp32_ws2812b_panel_framebuffer_pointer[s_esp32_ws2812b_panel_active_framebuffer_num][(index * 3) + 0] = color.g;
+    s_esp32_ws2812b_panel_framebuffer_pointer[s_esp32_ws2812b_panel_active_framebuffer_num][(index * 3) + 1] = color.r;
+    s_esp32_ws2812b_panel_framebuffer_pointer[s_esp32_ws2812b_panel_active_framebuffer_num][(index * 3) + 2] = color.b;
 
     if(s_debug)
     {
-        ets_printf(ESP32_WS2812B_PANEL_TAG" : set pixel (%u,%u). index = %u\n", x, y, index);
+        //ets_printf(ESP32_WS2812B_PANEL_TAG" : set pixel (%u,%u). index = %u\n", x, y, index);
     }
     return true;
 }
@@ -152,13 +263,6 @@ bool ESP32_WS2812B_PANEL_SetLineHorizontal(uint8_t x,
 {
     //HORIZONTAL LINE STARTING FROM SPECIFIED CORDINATES
     //OF SPECIFIED LENGTH AND COLOR
-
-    if(s_ongoing)
-    {
-        //IN MIDDLE OF REFRESHING
-        //DONT DISTURB BUFFER NOW
-        return false;
-    }
 
     if(x >= s_esp32_ws2812b_panel_count_col ||
         y >= s_esp32_ws2812b_panel_count_row ||
@@ -182,13 +286,6 @@ bool ESP32_WS2812B_PANEL_SetLineVertical(uint8_t x,
 {
     //VERTICAL LINE STARTING FROM SPECIFIED CORDINATES
     //OF SPECIFIED LENGTH AND COLOR
-
-    if(s_ongoing)
-    {
-        //IN MIDDLE OF REFRESHING
-        //DONT DISTURB BUFFER NOW
-        return false;
-    }
 
     if(x >= s_esp32_ws2812b_panel_count_col ||
         y >= s_esp32_ws2812b_panel_count_row ||
@@ -251,12 +348,6 @@ bool ESP32_WS2812B_PANEL_WriteStringXY(uint8_t x,
     //AT THE SPECIFIED CORDINATES
     //FONT USED = 6(WIDTH) x 8(HEIGHT)
 
-    if(s_ongoing)
-    {
-        //IN MIDDLE OF REFRESHING
-        //DONT DISTURB BUFFER NOW
-        return false;
-    }
 
     if(x >= s_esp32_ws2812b_panel_count_col ||
         y >= s_esp32_ws2812b_panel_count_row)
@@ -363,7 +454,6 @@ bool ESP32_WS2812B_PANEL_WriteStringJustified(esp32_ws2812b_panel_justify_t just
         default:
             break;
     }
-
     return ESP32_WS2812B_PANEL_WriteStringXY(x, y, str, str_len, color);
 }
 
@@ -371,236 +461,182 @@ bool ESP32_WS2812B_PANEL_Clear(void)
 {
     //CLEAR PANEL
 
-    if(s_ongoing)
+    s_esp32_ws2812b_panel_color_t black = {0, 0, 0};
+    for(uint8_t x = 0; x < s_esp32_ws2812b_panel_count_col; x++)
     {
-        //IN MIDDLE OF REFRESHING
-        //DONT DISTURB BUFFER NOW
-        return false;
-    }
-
-    //CLEAR PANEL
-    for(uint16_t i = 0; i < (s_esp32_ws2812b_panel_count_col * s_esp32_ws2812b_panel_count_row); i++)
-    {
-        s_esp32_ws2812b_panel_rgb_buffer[i].r = 0;
-        s_esp32_ws2812b_panel_rgb_buffer[i].g = 0;
-        s_esp32_ws2812b_panel_rgb_buffer[i].b = 0;
+        for(uint8_t y = 0; y < s_esp32_ws2812b_panel_count_row; y++)
+        {
+            ESP32_WS2812B_PANEL_SetPixel(x, y, black);
+        }
     }
 
     if(s_debug)
     {
         ets_printf(ESP32_WS2812B_PANEL_TAG" : clear\n");
     }
-
     return true;
 }
 
-void ESP32_WS28182B_PANEL_Refresh(void)
+static void s_esp32_ws2812b_panel_rmt_isr(void* arg)
 {
-    //REFRESH DISPLAY USING THE INTERNAL RGB BUFFER
-    //SEND THE WHOLE BUFFER OUT
+    //RMT INTERRUPT HANDLER
 
-    //BLOCK TILL LAST OPERATION COMPLETES
-    while(s_ongoing){};
-    
-    s_ongoing = true;
-
-    //START OPERATION
-    //SEND OUT DATA RGB PIXEL BY PIXEL
-    for(uint16_t m = 0; m < (s_esp32_ws2812b_panel_count_col * s_esp32_ws2812b_panel_count_row); m++)
+    if(RMT.int_st.ch0_tx_end)
     {
-        s_esp32_ws2812b_panel_send_next_pixel();
+        //TX END EVENT
+
+        //CLEAR EVENT
+        RMT.int_clr.ch0_tx_end = 1;
+
+        //END OF FRAMEBUFFFER. SWITCH
+        s_esp32_ws2812b_panel_switch_framebuffer();
+
+        ets_printf("RMT TX END\n");
+        return;
     }
 
-    s_ongoing = false;
-
-    if(s_debug)
+    if(RMT.int_st.ch0_tx_thr_event)
     {
-        ets_printf(ESP32_WS2812B_PANEL_TAG" : Refresh\n");
+        //TX THRESHOLD EVENT
+        //32 OF 64 RMT_32 ITEMS IN RMT MEM BLOCK 1 DONE
+
+        //CLEAR EVENT
+        RMT.int_clr.ch0_tx_thr_event = 1;
+
+        //DO HALF COPY
+        s_esp32_ws2812b_panel_copy_half_buffer(s_esp32_ws2812b_panel_half_copy_pointer);
+        s_esp32_ws2812b_panel_half_copy_pointer = !s_esp32_ws2812b_panel_half_copy_pointer;
+
+        ets_printf("RMT THR\n");
+        return;
     }
 }
 
-static void s_esp32_ws2812b_panel_send_next_pixel(void)
+static void s_esp32_ws2812b_panel_reset(void)
 {
-    //SEND NEXT PIXEL OUT USING RMT PERIPHERAL
+    //RESET WS2812B PANEL BY SENDING RESET PULSE
 
-    static uint32_t counter = 0;
-    uint8_t pixel_r = s_esp32_ws2812b_next_pixel_pointer->r;
-    uint8_t pixel_g = s_esp32_ws2812b_next_pixel_pointer->g;
-    uint8_t pixel_b = s_esp32_ws2812b_next_pixel_pointer->b;  
+    gpio_set_level(s_esp32_ws2812b_panel_data_gpio, 0);
+    ESP32_UTIL_DelayBlockingMs(50);
+    gpio_set_level(s_esp32_ws2812b_panel_data_gpio, 1);
 
-    //INITIALIZE RMT PIXEL WITH DEFAULT VALUES
-    for(uint8_t i = 0; i < 24; i++)
-    {
-        s_exp32_ws2812b_rmt_pixel[i].level0 = 1;
-        s_exp32_ws2812b_rmt_pixel[i].level1 = 0;
-        //MAKE BY DEFAULT ALL WS2812B BITS AS 0
-        s_exp32_ws2812b_rmt_pixel[i].duration0 = 1;
-        s_exp32_ws2812b_rmt_pixel[i].duration1 = 2;
-    }
+    ets_printf(ESP32_WS2812B_PANEL_TAG" : RESET\n");
+}
 
-    //NOW FILL IN ALL 1 BITS IN WS2812B BITS
-    //GREEN
-    if(pixel_g & 128)
+static void s_esp32_ws2812b_panel_switch_framebuffer(void)
+{
+    //SWITCH FRAMBUFFER
+
+    s_esp32_ws2812b_panel_active_framebuffer_num = !s_esp32_ws2812b_panel_active_framebuffer_num;
+}
+
+static void s_esp32_ws2812b_panel_copy_full_buffer(void)
+{
+    //FILL RMT DATA SPACE WITH FULL DATA (1 MEM BLOCK = 64 RMT_32 ITEMS)
+    //WILL ONLY BE CALLED AT START OF FRAME RENDERING
+    //RMT 1 MEMBLOCK CAN HOLD 64 RMT_32 ITEMS = 64 WS2812 BITS = 64 WS2812 BYTES
+    //IN RMT_32 ITEM, DATA IS SENT HIGH FIRST, IE LEVEL1 IS SENT FIRST
+
+    esp32_ws2812b_panel_rmt_bit_u rmt_bit;
+    uint16_t counter = 0;
+    uint8_t val;
+    uint8_t data_end = 0;
+
+    //CHECK IF TOTAL WS28182 PIXEL DATA CAN FIT IN SINGLE MEM BLOCK WITH NO WRAP
+    //AROUND. IF SO ADD TERMINATING 0 ASLO
+    if((s_esp32_ws2812b_panel_framebuffer_total_bytes * 8) < 64)
     {
-        //1
-        s_exp32_ws2812b_rmt_pixel[0].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[0].duration1 = 1;
+        data_end = s_esp32_ws2812b_panel_framebuffer_total_bytes;
     }
-    if(pixel_g & 64)
+    else
     {
-        //1
-        s_exp32_ws2812b_rmt_pixel[1].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[1].duration1 = 1;
-    }
-    if(pixel_g & 32)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[2].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[2].duration1 = 1;
-    }
-    if(pixel_g & 16)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[3].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[3].duration1 = 1;
-    }
-    if(pixel_g & 8)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[4].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[4].duration1 = 1;
-    }
-    if(pixel_g & 4)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[5].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[5].duration1 = 1;
-    }
-    if(pixel_g & 2)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[6].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[6].duration1 = 1;
-    }
-    if(pixel_g & 1)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[7].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[7].duration1 = 1;
+        data_end = 8;
     }
 
-    //RED
-    if(pixel_r & 128)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[8].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[8].duration1 = 1;
+    ets_printf("full copy till %u\n", data_end);
+
+    for(uint8_t i = 0; i < data_end; i++)
+    {   
+        val = s_esp32_ws2812b_panel_framebuffer_pointer[!s_esp32_ws2812b_panel_active_framebuffer_num][i];
+        for(uint8_t j = 0; j < 8; j++)
+        {
+            if(val & 0x70)
+            {
+                rmt_bit.components.level1 = 1;
+                rmt_bit.components.duration1 = ESP32_WS28122B_PANEL_PULSE_T1H;
+                rmt_bit.components.level0 = 0;
+                rmt_bit.components.duration0 = ESP32_WS28122B_PANEL_PULSE_T1L;
+                //ets_printf("bit 1: %u %u %u %u\n", rmt_bit.components.level1, rmt_bit.components.duration1, rmt_bit.components.level0, rmt_bit.components.duration0);
+                RMTMEM.chan[0].data32[counter].val = rmt_bit.val;
+            }
+            else
+            {
+                rmt_bit.components.level1 = 1;
+                rmt_bit.components.duration1 = ESP32_WS28122B_PANEL_PULSE_T0H;
+                rmt_bit.components.level0 = 0;
+                rmt_bit.components.duration0 = ESP32_WS28122B_PANEL_PULSE_T0L;
+                //ets_printf("bit 0: %u %u %u %u\n", rmt_bit.components.level1, rmt_bit.components.duration1, rmt_bit.components.level0, rmt_bit.components.duration0);
+                RMTMEM.chan[0].data32[counter].val = rmt_bit.val;
+            }
+            ets_printf("%u\n", rmt_bit.val);
+            val = val << 1;
+            counter++;
+        }
+        s_esp32_ws2812b_panel_framebuffer_data_counter++;
     }
-    if(pixel_r & 64)
+}
+
+static void s_esp32_ws2812b_panel_copy_half_buffer(bool at_beginning)
+{
+    //COPY HALF BUFFER TO RMT DATA SPACE (32 RMT_32 BITS)
+    //WEATHER TO COPY FROM RMT DATA SPACE BEGENNING OR FROM
+    //THE MIDDLE DEPENDS ON THE BOOL ARGUMENT
+    //RMT 1 MEMBLOCK CAN HOLD 64 RMT_32 ITEMS = 64 WS2812 BITS = 64 WS2812 BYTES
+    //IN RMT_32 ITEM, DATA IS SENT HIGH FIRST, IE LEVEL1 IS SENT FIRST
+
+    esp32_ws2812b_panel_rmt_bit_u rmt_bit;
+    uint16_t counter = 0;
+    uint8_t starting;
+    uint8_t val;
+
+    starting = ((at_beginning) ? 0 : 32);
+
+    //CHECK FOR TX DATA ENDING
+    if(s_esp32_ws2812b_panel_framebuffer_data_counter == s_esp32_ws2812b_panel_framebuffer_total_bytes)
     {
-        //1
-        s_exp32_ws2812b_rmt_pixel[9].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[9].duration1 = 1;
-    }
-    if(pixel_r & 32)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[10].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[10].duration1 = 1;
-    }
-    if(pixel_r & 16)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[11].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[11].duration1 = 1;
-    }
-    if(pixel_r & 8)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[12].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[12].duration1 = 1;
-    }
-    if(pixel_r & 4)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[13].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[13].duration1 = 1;
-    }
-    if(pixel_r & 2)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[14].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[14].duration1 = 1;
-    }
-    if(pixel_r & 1)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[15].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[15].duration1 = 1;
+        //FRAMEBUFFER DATA END HAS REACHED
+        //INSERT 0 TO END RMT T
+        RMTMEM.chan[0].data32[starting].val = 0;
     }
 
-    //BLUE
-    if(pixel_b & 128)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[16].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[16].duration1 = 1;
-    }
-    if(pixel_b & 64)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[17].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[17].duration1 = 1;
-    }
-    if(pixel_b & 32)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[18].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[18].duration1 = 1;
-    }
-    if(pixel_b & 16)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[19].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[19].duration1 = 1;
-    }
-    if(pixel_b & 8)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[20].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[20].duration1 = 1;
-    }
-    if(pixel_b & 4)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[21].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[21].duration1 = 1;
-    }
-    if(pixel_b & 2)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[22].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[22].duration1 = 1;
-    }
-    if(pixel_b & 1)
-    {
-        //1
-        s_exp32_ws2812b_rmt_pixel[23].duration0 = 2;
-        s_exp32_ws2812b_rmt_pixel[23].duration1 = 1;
-    }
+    ets_printf("half copy from %u till %u\n", starting, starting + 4);
 
-    //SEND OUT THE PIXEL IN BLOCKING MODE
-    rmt_write_items(0, s_exp32_ws2812b_rmt_pixel, 24, true);
-
-    //MODIFY COUNTERS FOR NEXT WRITE
-    s_esp32_ws2812b_next_pixel_pointer++;
-    counter++;
-    if(counter >= (s_esp32_ws2812b_panel_count_row * s_esp32_ws2812b_panel_count_col))
-    {
-        //ALL PIXELS SENT
-        //RESET PIX_POINTER
-        counter = 0;
-        s_esp32_ws2812b_next_pixel_pointer = &s_esp32_ws2812b_panel_rgb_buffer[0];
+    for(uint8_t i = 0; i < (8/2); i++)
+    {   
+        val = s_esp32_ws2812b_panel_framebuffer_pointer[!s_esp32_ws2812b_panel_active_framebuffer_num][s_esp32_ws2812b_panel_framebuffer_data_counter];
+        for(uint8_t j = 0; j < 8; j++)
+        {
+            if(val & 0x70)
+            {
+                rmt_bit.components.level1 = 1;
+                rmt_bit.components.duration1 = ESP32_WS28122B_PANEL_PULSE_T1H;
+                rmt_bit.components.level0 = 0;
+                rmt_bit.components.duration0 = ESP32_WS28122B_PANEL_PULSE_T1L;
+                RMTMEM.chan[0].data32[starting + counter].val = rmt_bit.val;
+            }
+            else
+            {
+                rmt_bit.components.level1 = 1;
+                rmt_bit.components.duration1 = ESP32_WS28122B_PANEL_PULSE_T0H;
+                rmt_bit.components.level0 = 0;
+                rmt_bit.components.duration0 = ESP32_WS28122B_PANEL_PULSE_T0L;
+                RMTMEM.chan[0].data32[starting + counter].val = rmt_bit.val;
+            }
+            ets_printf("%u\n", rmt_bit.val);
+            val = val << 1;
+            counter++;
+        }
+        s_esp32_ws2812b_panel_framebuffer_data_counter++;
     }
 }
 
