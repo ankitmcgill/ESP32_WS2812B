@@ -35,7 +35,7 @@
 #include "esp_log.h"
 
 #define ESP32_WS2812B_PANEL_TAG         "ESP32:WS2812B_PANEL"
-#define ESP32_WS2812B_PANEL_ROW_MAX     (31)
+#define ESP32_WS2812B_PANEL_ROW_MAX     (32)
 
 typedef enum
 {
